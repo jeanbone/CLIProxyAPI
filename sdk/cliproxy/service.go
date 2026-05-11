@@ -1517,7 +1517,7 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 			addModel(model)
 		}
 		clone := *model
-		clone.ID = trimmedPrefix + "/" + baseID
+		clone.ID = trimmedPrefix + "-" + baseID
 		addModel(&clone)
 	}
 	return out

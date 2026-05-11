@@ -2225,6 +2225,142 @@
       "display_name": "GPT 4.1",
       "context_length": 1047576,
       "max_completion_tokens": 32768
+    },
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1776902400,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "GPT 5.5",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "claude-opus-4.7",
+      "object": "model",
+      "created": 1776297600,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "Claude Opus 4.7",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "min": 1024,
+        "max": 128000,
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "claude-opus-4.6",
+      "object": "model",
+      "created": 1770318000,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "Claude Opus 4.6",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "min": 1024,
+        "max": 128000,
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "claude-opus-4.5",
+      "object": "model",
+      "created": 1761955200,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "Claude Opus 4.5",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 128000,
+        "zero_allowed": true
+      }
+    },
+    {
+      "id": "gpt-4o",
+      "object": "model",
+      "created": 1715558400,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "GPT 4o",
+      "context_length": 128000,
+      "max_completion_tokens": 16384
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "object": "model",
+      "created": 1742169600,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "Gemini 2.5 Pro",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 1,
+        "max": 65536,
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "object": "model",
+      "created": 1770307200,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "Gemini 3 Flash Preview",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 1,
+        "max": 65536,
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    {
+      "id": "grok-code-fast-1",
+      "object": "model",
+      "created": 1770307200,
+      "owned_by": "github-copilot",
+      "type": "github-copilot",
+      "display_name": "Grok Code Fast 1",
+      "context_length": 131072,
+      "max_completion_tokens": 32768
     }
   ]
 }

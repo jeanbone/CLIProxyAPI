@@ -1732,11 +1732,13 @@ func rewriteModelForAuth(model string, auth *Auth) string {
 	if prefix == "" {
 		return model
 	}
-	needle := prefix + "/"
-	if !strings.HasPrefix(model, needle) {
-		return model
+	for _, sep := range []string{"/", "-"} {
+		needle := prefix + sep
+		if strings.HasPrefix(model, needle) {
+			return strings.TrimPrefix(model, needle)
+		}
 	}
-	return strings.TrimPrefix(model, needle)
+	return model
 }
 
 func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) string {
@@ -2528,6 +2530,10 @@ func isModelSupportErrorMessage(message string) bool {
 		"model unavailable",
 		"not available for your plan",
 		"not available for your account",
+		"model is not available for integrator",
+		"model_not_available_for_integrator",
+		"invalid_model_id",
+		"invalid model",
 	}
 	for _, pattern := range patterns {
 		if strings.Contains(lower, pattern) {
