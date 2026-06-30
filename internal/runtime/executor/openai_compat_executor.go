@@ -837,10 +837,39 @@ func convertResponsesStreamLine(line []byte) []byte {
 		result = append(result, []byte("\ndata: [DONE]")...)
 		return result
 
-	case "response.output_item.added", "response.output_item.done",
+	case "response.output_item.added":
+		// When a function_call item is added, emit the initial tool_call chunk with id and name
+		itemType := gjson.GetBytes(data, "item.type").String()
+		if itemType == "function_call" {
+			callID := gjson.GetBytes(data, "item.call_id").String()
+			name := gjson.GetBytes(data, "item.name").String()
+			idx := gjson.GetBytes(data, "output_index").Int()
+			chunk, _ := json.Marshal(map[string]any{
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": []map[string]any{{
+							"index": idx,
+							"id":    callID,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      name,
+								"arguments": "",
+							},
+						}},
+					},
+					"finish_reason": nil,
+				}},
+			})
+			return append([]byte("data: "), chunk...)
+		}
+		return nil
+
+	case "response.output_item.done",
 		"response.content_part.added", "response.content_part.done",
-		"response.created", "response.in_progress":
-		// Skip these events — they don't map to chat completions streaming
+		"response.created", "response.in_progress",
+		"response.function_call_arguments.done":
+		// Skip these events — they don't need direct mapping to chat completions streaming
 		return nil
 
 	default:
