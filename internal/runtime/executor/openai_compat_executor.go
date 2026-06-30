@@ -31,6 +31,183 @@ type OpenAICompatExecutor struct {
 	cfg      *config.Config
 }
 
+// copilotResponsesOnlyModels lists Copilot models that only support the /responses
+// endpoint (not /chat/completions). These are newer OpenAI reasoning models.
+var copilotResponsesOnlyModels = map[string]bool{
+	"gpt-5.5":       true,
+	"gpt-5.4-mini":  true,
+	"gpt-5.3-codex": true,
+}
+
+// isCopilotResponsesModel returns true if the model requires the /responses endpoint
+// when used through GitHub Copilot.
+func (e *OpenAICompatExecutor) isCopilotResponsesModel(model string) bool {
+	if e.provider != "github-copilot" {
+		return false
+	}
+	// Strip copilot- prefix if present
+	bare := strings.TrimPrefix(model, "copilot-")
+	return copilotResponsesOnlyModels[bare]
+}
+
+// convertChatCompletionsToResponses converts an OpenAI Chat Completions request
+// into an OpenAI Responses API request. This is used for Copilot models that
+// only support /responses (gpt-5.5, gpt-5.4-mini, gpt-5.3-codex).
+func convertChatCompletionsToResponses(payload []byte, stream bool) []byte {
+	root := gjson.ParseBytes(payload)
+
+	out := []byte(`{}`)
+	// Model
+	if v := root.Get("model"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "model", v.String())
+	}
+	// Stream
+	out, _ = sjson.SetBytes(out, "stream", stream)
+
+	// max_tokens / max_completion_tokens → max_output_tokens
+	if v := root.Get("max_completion_tokens"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "max_output_tokens", v.Int())
+	} else if v := root.Get("max_tokens"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "max_output_tokens", v.Int())
+	}
+
+	// Build input array from messages
+	var input []any
+	var instructions string
+	messages := root.Get("messages")
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		role := msg.Get("role").String()
+		switch role {
+		case "system":
+			// System messages become instructions
+			content := msg.Get("content").String()
+			if instructions != "" {
+				instructions += "\n\n"
+			}
+			instructions += content
+		case "user":
+			content := msg.Get("content")
+			if content.IsArray() {
+				// Multi-part content: extract text parts
+				var textParts []string
+				content.ForEach(func(_, part gjson.Result) bool {
+					if part.Get("type").String() == "text" {
+						textParts = append(textParts, part.Get("text").String())
+					}
+					return true
+				})
+				input = append(input, map[string]any{
+					"role":    "user",
+					"content": strings.Join(textParts, "\n"),
+					"type":    "message",
+				})
+			} else {
+				input = append(input, map[string]any{
+					"role":    "user",
+					"content": content.String(),
+					"type":    "message",
+				})
+			}
+		case "assistant":
+			content := msg.Get("content")
+			if content.IsArray() {
+				// Tool calls in assistant message
+				var textContent string
+				var toolCalls []any
+				content.ForEach(func(_, part gjson.Result) bool {
+					switch part.Get("type").String() {
+					case "text":
+						textContent = part.Get("text").String()
+					}
+					return true
+				})
+				if textContent != "" {
+					input = append(input, map[string]any{
+						"role":    "assistant",
+						"content": textContent,
+						"type":    "message",
+					})
+				}
+				_ = toolCalls
+			} else {
+				input = append(input, map[string]any{
+					"role":    "assistant",
+					"content": content.String(),
+					"type":    "message",
+				})
+			}
+			// Handle tool_calls
+			if tc := msg.Get("tool_calls"); tc.Exists() && tc.IsArray() {
+				tc.ForEach(func(_, call gjson.Result) bool {
+					input = append(input, map[string]any{
+						"type":      "function_call",
+						"call_id":   call.Get("id").String(),
+						"name":      call.Get("function.name").String(),
+						"arguments": call.Get("function.arguments").String(),
+					})
+					return true
+				})
+			}
+		case "tool":
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": msg.Get("tool_call_id").String(),
+				"output":  msg.Get("content").String(),
+			})
+		}
+		return true
+	})
+
+	if instructions != "" {
+		out, _ = sjson.SetBytes(out, "instructions", instructions)
+	}
+	if len(input) > 0 {
+		out, _ = sjson.SetBytes(out, "input", input)
+	} else {
+		out, _ = sjson.SetRawBytes(out, "input", []byte("[]"))
+	}
+
+	// Tools: convert from chat completions format to responses format
+	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
+		var responsesTools []any
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			if tool.Get("type").String() == "function" {
+				fn := tool.Get("function")
+				t := map[string]any{
+					"type":        "function",
+					"name":        fn.Get("name").String(),
+					"description": fn.Get("description").String(),
+				}
+				if params := fn.Get("parameters"); params.Exists() {
+					t["parameters"] = json.RawMessage(params.Raw)
+				}
+				responsesTools = append(responsesTools, t)
+			}
+			return true
+		})
+		if len(responsesTools) > 0 {
+			out, _ = sjson.SetBytes(out, "tools", responsesTools)
+		}
+	}
+
+	// Tool choice
+	if tc := root.Get("tool_choice"); tc.Exists() {
+		out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(tc.Raw))
+	}
+
+	// Temperature
+	if v := root.Get("temperature"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "temperature", v.Float())
+	}
+
+	// Top-p
+	if v := root.Get("top_p"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "top_p", v.Float())
+	}
+
+	return out
+}
+
 // NewOpenAICompatExecutor creates an executor bound to a provider key (e.g., "openrouter").
 func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatExecutor {
 	return &OpenAICompatExecutor{provider: provider, cfg: cfg}
@@ -75,6 +252,7 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
+
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
@@ -87,9 +265,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
+	useResponsesAPI := false
 	if opts.Alt == "responses/compact" {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses/compact"
+	} else if e.isCopilotResponsesModel(baseModel) {
+		useResponsesAPI = true
+		endpoint = "/responses"
 	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -114,12 +296,17 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	// Copilot GPT models require max_completion_tokens instead of max_tokens
-	if e.provider == "github-copilot" {
+	if e.provider == "github-copilot" && !useResponsesAPI {
 		if v := gjson.GetBytes(translated, "max_tokens"); v.Exists() {
 			translated, _ = sjson.SetBytes(translated, "max_completion_tokens", v.Value())
 			translated, _ = sjson.DeleteBytes(translated, "max_tokens")
 		}
 		translated, _ = sjson.DeleteBytes(translated, "reasoning_effort")
+	}
+
+	// For /responses-only models: convert the chat completions payload to Responses API format
+	if useResponsesAPI {
+		translated = convertChatCompletionsToResponses(translated, opts.Stream)
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -185,13 +372,20 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	// Translate response back to source format when needed
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
+	// For /responses models, convert the Responses API response to Chat Completions format
+	// so the existing openai→claude translator can handle it.
+	responseBody := body
+	if useResponsesAPI {
+		responseBody = convertResponsesResponseToChatCompletions(body)
+	}
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, responseBody, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
 
 func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -204,6 +398,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
+	endpoint := "/chat/completions"
+	useResponsesAPI := e.isCopilotResponsesModel(baseModel)
+	if useResponsesAPI {
+		endpoint = "/responses"
+	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -223,10 +422,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	if !useResponsesAPI {
+		translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	}
 
 	// Copilot GPT models require max_completion_tokens instead of max_tokens
-	if e.provider == "github-copilot" {
+	if e.provider == "github-copilot" && !useResponsesAPI {
 		if v := gjson.GetBytes(translated, "max_tokens"); v.Exists() {
 			translated, _ = sjson.SetBytes(translated, "max_completion_tokens", v.Value())
 			translated, _ = sjson.DeleteBytes(translated, "max_tokens")
@@ -235,7 +436,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		translated, _ = sjson.DeleteBytes(translated, "reasoning_effort")
 	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	// For /responses endpoint, ensure stream is set and remove stream_options
+	if useResponsesAPI {
+		translated = convertChatCompletionsToResponses(translated, true)
+	}
+
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -327,8 +533,18 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				continue
 			}
 
+			// For /responses API, convert SSE lines to chat completions format first
+			processLine := bytes.Clone(trimmedLine)
+			if useResponsesAPI {
+				converted := convertResponsesStreamLine(processLine)
+				if converted == nil {
+					continue
+				}
+				processLine = converted
+			}
+
 			// OpenAI-compatible streams must use SSE data lines.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, processLine, &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -456,6 +672,180 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+// convertResponsesResponseToChatCompletions converts an OpenAI Responses API response
+// to a Chat Completions response so the existing openai→claude translator can handle it.
+func convertResponsesResponseToChatCompletions(body []byte) []byte {
+	root := gjson.ParseBytes(body)
+
+	out := []byte(`{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+
+	// ID
+	if v := root.Get("id"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "id", v.String())
+	}
+	// Model
+	if v := root.Get("model"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "model", v.String())
+	}
+	// Created
+	if v := root.Get("created_at"); v.Exists() {
+		out, _ = sjson.SetBytes(out, "created", v.Int())
+	}
+
+	// Extract content and tool calls from output
+	var textParts []string
+	var toolCalls []map[string]any
+	toolCallIdx := 0
+
+	output := root.Get("output")
+	if output.Exists() && output.IsArray() {
+		output.ForEach(func(_, item gjson.Result) bool {
+			switch item.Get("type").String() {
+			case "message":
+				item.Get("content").ForEach(func(_, content gjson.Result) bool {
+					if content.Get("type").String() == "output_text" {
+						textParts = append(textParts, content.Get("text").String())
+					}
+					return true
+				})
+			case "function_call":
+				tc := map[string]any{
+					"id":   item.Get("call_id").String(),
+					"type": "function",
+					"function": map[string]any{
+						"name":      item.Get("name").String(),
+						"arguments": item.Get("arguments").String(),
+					},
+					"index": toolCallIdx,
+				}
+				toolCalls = append(toolCalls, tc)
+				toolCallIdx++
+			}
+			return true
+		})
+	}
+
+	// Set content
+	content := strings.Join(textParts, "")
+	if content != "" {
+		out, _ = sjson.SetBytes(out, "choices.0.message.content", content)
+	}
+
+	// Set tool calls
+	if len(toolCalls) > 0 {
+		out, _ = sjson.SetBytes(out, "choices.0.message.tool_calls", toolCalls)
+		out, _ = sjson.SetBytes(out, "choices.0.finish_reason", "tool_calls")
+	}
+
+	// Usage
+	if usage := root.Get("usage"); usage.Exists() {
+		if v := usage.Get("input_tokens"); v.Exists() {
+			out, _ = sjson.SetBytes(out, "usage.prompt_tokens", v.Int())
+		}
+		if v := usage.Get("output_tokens"); v.Exists() {
+			out, _ = sjson.SetBytes(out, "usage.completion_tokens", v.Int())
+		}
+		total := usage.Get("input_tokens").Int() + usage.Get("output_tokens").Int()
+		out, _ = sjson.SetBytes(out, "usage.total_tokens", total)
+	}
+
+	return out
+}
+
+// convertResponsesStreamLine converts a streaming SSE line from the Responses API
+// into an OpenAI Chat Completions streaming format line.
+func convertResponsesStreamLine(line []byte) []byte {
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return nil
+	}
+	data := bytes.TrimSpace(line[5:])
+	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+		return line
+	}
+
+	eventType := gjson.GetBytes(data, "type").String()
+	switch eventType {
+	case "response.output_text.delta":
+		delta := gjson.GetBytes(data, "delta").String()
+		chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":"%s"},"finish_reason":null}]}`,
+			strings.ReplaceAll(strings.ReplaceAll(delta, `\`, `\\`), `"`, `\"`))
+		return []byte("data: " + chunk)
+
+	case "response.function_call_arguments.delta":
+		delta := gjson.GetBytes(data, "delta").String()
+		callID := gjson.GetBytes(data, "call_id").String()
+		name := gjson.GetBytes(data, "name").String()
+		idx := gjson.GetBytes(data, "output_index").Int()
+		var chunk []byte
+		if name != "" {
+			// First chunk of function call with name
+			chunk, _ = json.Marshal(map[string]any{
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": []map[string]any{{
+							"index": idx,
+							"id":    callID,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      name,
+								"arguments": delta,
+							},
+						}},
+					},
+					"finish_reason": nil,
+				}},
+			})
+		} else {
+			chunk, _ = json.Marshal(map[string]any{
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": []map[string]any{{
+							"index":    idx,
+							"function": map[string]any{"arguments": delta},
+						}},
+					},
+					"finish_reason": nil,
+				}},
+			})
+		}
+		return append([]byte("data: "), chunk...)
+
+	case "response.completed":
+		// Convert to final chunk with stop reason and usage
+		finishReason := "stop"
+		if output := gjson.GetBytes(data, "response.output"); output.Exists() {
+			output.ForEach(func(_, item gjson.Result) bool {
+				if item.Get("type").String() == "function_call" {
+					finishReason = "tool_calls"
+					return false
+				}
+				return true
+			})
+		}
+		chunk, _ := json.Marshal(map[string]any{
+			"choices": []map[string]any{{
+				"index":         0,
+				"delta":         map[string]any{},
+				"finish_reason": finishReason,
+			}},
+		})
+		result := append([]byte("data: "), chunk...)
+		result = append(result, []byte("\ndata: [DONE]")...)
+		return result
+
+	case "response.output_item.added", "response.output_item.done",
+		"response.content_part.added", "response.content_part.done",
+		"response.created", "response.in_progress":
+		// Skip these events — they don't map to chat completions streaming
+		return nil
+
+	default:
+		return nil
+	}
 }
 
 type statusErr struct {
